@@ -10,18 +10,28 @@ export default {
          header BYTEA NOT NULL,
          txids BYTEA NOT NULL)`,
       `CREATE TABLE transactions (
-         txid BYTEA PRIMARY KEY,
+         id BIGSERIAL PRIMARY KEY,
+         txid BYTEA NOT NULL,
          height INTEGER,
          tx BYTEA NOT NULL)`,
-      `CREATE TABLE history (
-         address BYTEA,
-         otxid BYTEA,
-         oindex INTEGER,
-         ovalue BIGINT,
-         oscript BYTEA,
-         oheight INTEGER,
-         itxid BYTEA,
-         iheight INTEGER)`,
+      `CREATE TABLE addresses (
+         id BIGSERIAL PRIMARY KEY,
+         address BYTEA NOT NULL)`,
+      `CREATE TABLE outputs (
+         id BIGSERIAL PRIMARY KEY,
+         tx_id BIGINT NOT NULL REFERENCES transactions (id),
+         index INTEGER NOT NULL,
+         value BIGINT NOT NULL,
+         script BYTEA NOT NULL,
+         height INTEGER)`,
+      `CREATE TABLE outputs_addresses (
+         output_id BIGINT NOT NULL REFERENCES outputs (id),
+         address_id BIGINT NOT NULL REFERENCES addresses (id))`,
+      `CREATE TABLE inputs (
+         output_id BIGINT NOT NULL REFERENCES outputs (id),
+         tx_id BIGINT NOT NULL REFERENCES transactions (id),
+         index INTEGER NOT NULL,
+         height INTEGER)`,
       `CREATE TABLE new_txs (
          id SERIAL PRIMARY KEY,
          tx BYTEA NOT NULL)`,
@@ -32,14 +42,19 @@ export default {
     ],
     indices: [
       `CREATE INDEX ON blocks (hash)`,
+      `CREATE UNIQUE INDEX ON transactions (txid)`,
       `CREATE INDEX ON transactions (height)`,
-      `CREATE INDEX ON history (address)`,
-      `CREATE INDEX ON history (address, itxid)`,
-      `CREATE INDEX ON history (otxid, oindex)`,
-      `CREATE INDEX ON history (otxid)`,
-      `CREATE INDEX ON history (oheight)`,
-      `CREATE INDEX ON history (itxid)`,
-      `CREATE INDEX ON history (iheight)`,
+      `CREATE UNIQUE INDEX ON addresses (address)`,
+      `CREATE INDEX ON outputs (tx_id)`,
+      `CREATE UNIQUE INDEX ON outputs (tx_id, index)`,
+      `CREATE INDEX ON outputs (height)`,
+      `CREATE INDEX ON outputs_addresses (output_id)`,
+      `CREATE INDEX ON outputs_addresses (address_id)`,
+      `CREATE UNIQUE INDEX ON outputs_addresses (output_id, address_id)`,
+      `CREATE INDEX ON inputs (output_id)`,
+      `CREATE INDEX ON inputs (tx_id)`,
+      `CREATE UNIQUE INDEX ON inputs (tx_id, index)`,
+      `CREATE INDEX ON inputs (height)`,
       `CREATE INDEX ON cc_scanned_txids (blockhash)`,
       `CREATE INDEX ON cc_scanned_txids (height)`
     ]
@@ -58,19 +73,70 @@ export default {
       confirmed: `INSERT INTO transactions
                     (txid, height, tx)
                   VALUES
-                    ($1, $2, $3)`,
+                    ($1, $2, $3)
+                  RETURNING
+                    id AS id`,
       unconfirmed: `INSERT INTO transactions
                       (txid, tx)
                     VALUES
-                      ($1, $2)`
+                      ($1, $2)
+                    RETURNING
+                      id AS id`
+    },
+    outputs: {
+      confirmed: `INSERT INTO outputs
+                    (tx_id, index, value, script, height)
+                  VALUES
+                    ($1, $2, $3, $4, $5)
+                  RETURNING
+                    id AS id`
+    },
+    outputs_addresses: {
+      row: `WITH addresses_new AS (
+              INSERT INTO addresses
+                (address)
+              SELECT
+                $2
+              WHERE
+                NOT EXISTS (
+                  SELECT
+                    *
+                  FROM
+                    addresses
+                  WHERE
+                    address = $2
+                )
+              RETURNING
+                id AS id
+            )
+            INSERT INTO outputs_addresses
+              (output_id, address_id)
+            VALUES
+              ($1,
+               (SELECT id FROM addresses_new
+                UNION
+                SELECT id FROM addresses WHERE address = $2))`
+    },
+    inputs: {
+      confirmed: `INSERT INTO inputs
+                    (output_id, tx_id, index, height)
+                  VALUES
+                    ((SELECT
+                        outputs.id
+                      FROM
+                        outputs
+                      INNER JOIN
+                        transactions ON outputs.tx_id = transactions.id
+                      WHERE
+                        transactions.txid = $1 AND
+                        outputs.index = $2),
+                     $3,
+                     $4,
+                     $5)`
     },
     history: {
-      confirmedOutput: `INSERT INTO history
-                          (address, otxid, oindex, ovalue, oscript, oheight)
-                        VALUES
-                          ($1, $2, $3, $4, $5, $6)`,
       unconfirmedOutput: `INSERT INTO history
-                            (address, otxid, oindex, ovalue, oscript)
+                            (address_id, output_tx_id, output_index, output_value, output_script)
                           VALUES
                             ($1, $2, $3, $4, $5)`
     },
@@ -126,9 +192,8 @@ export default {
                         height = $1`,
       txIdsByTxId: `SELECT
                       blocks.height AS height,
-                      hash AS hash,
-                      txids AS txids,
-                      txid AS txid
+                      blocks.hash AS hash,
+                      blocks.txids AS txids
                     FROM
                       blocks
                     RIGHT OUTER JOIN
@@ -156,12 +221,14 @@ export default {
                   height <= $2
                 ORDER BY
                   height ASC`,
-      exists: `SELECT EXISTS (SELECT
-                                true
-                              FROM
-                                blocks
-                              WHERE
-                                hash = $1)`
+      exists: `SELECT EXISTS (
+                 SELECT
+                   true
+                 FROM
+                   blocks
+                 WHERE
+                   hash = $1
+               )`
     },
     transactions: {
       byTxId: `SELECT
@@ -176,13 +243,16 @@ export default {
                   transactions
                 WHERE
                   txid = ANY($1)`,
-      exists: `SELECT EXISTS (SELECT
-                                true
-                              FROM
-                                transactions
-                              WHERE
-                                txid = $1)`,
+      exists: `SELECT EXISTS (
+                 SELECT
+                   true
+                 FROM
+                   transactions
+                 WHERE
+                   txid = $1
+               )`,
       existsMany: `SELECT
+                     id AS id,
                      txid AS txid
                    FROM
                      transactions
@@ -195,65 +265,120 @@ export default {
                     WHERE
                       height IS NULL`
     },
+    addresses: {
+      byOutputHeight: `SELECT
+                         addresses.address AS address,
+                         transactions.txid AS txid
+                       FROM
+                         outputs
+                       INNER JOIN
+                         transactions ON transactions.id = outputs.tx_id
+                       INNER JOIN
+                         outputs_addresses ON outputs_addresses.output_id = outputs.id
+                       INNER JOIN
+                         addresses ON addresses.id = outputs_addresses.address_id
+                       WHERE
+                         outputs.height = $1`,
+      byInputHeight: `SELECT
+                        addresses.address AS address,
+                        transactions.txid AS txid
+                      FROM
+                        inputs
+                      INNER JOIN
+                        outputs ON outputs.id = inputs.output_id
+                      INNER JOIN
+                        transactions ON transactions.id = outputs.tx_id
+                      INNER JOIN
+                        outputs_addresses ON outputs_addresses.output_id = outputs.id
+                      INNER JOIN
+                        addresses ON addresses.id = outputs_addresses.address_id
+                      WHERE
+                        inputs.height = $1`
+    },
     history: {
       transactions: `SELECT
-                       otxid AS otxid,
-                       oheight AS oheight,
-                       itxid AS itxid,
-                       iheight AS iheight
+                       output_transactions.txid AS otxid,
+                       history.output_height AS oheight,
+                       input_transactions.txid AS itxid,
+                       history.input_height AS iheight
                      FROM
                        history
+                     INNER JOIN
+                       addresses ON addresses.id = history.address_id
+                     INNER JOIN
+                       transactions AS output_transactions ON output_transactions.id = history.output_tx_id
+                     LEFT OUTER JOIN
+                       transactions AS input_transactions ON input_transactions.id = history.input_tx_id
                      WHERE
-                       address = ANY($1) AND
-                       (((oheight > $2 OR iheight > $2) AND (oheight <= $3 OR iheight <= $3)) OR
-                        oheight IS NULL OR
-                        (iheight IS NULL AND itxid IS NOT NULL))`,
+                       addresses.address = ANY($1) AND
+                       (((history.output_height > $2 OR history.input_height > $2) AND
+                         (history.output_height <= $3 OR history.input_height <= $3)) OR
+                        history.output_height IS NULL OR
+                        (history.input_height IS NULL AND history.input_tx_id IS NOT NULL))`,
       transactionsToLatest: `SELECT
-                               otxid AS otxid,
-                               oheight AS oheight,
-                               itxid AS itxid,
-                               iheight AS iheight
+                               output_transactions.txid AS otxid,
+                               history.output_height AS oheight,
+                               input_transactions.txid AS itxid,
+                               history.input_height AS iheight
                              FROM
                                history
+                             INNER JOIN
+                               addresses ON addresses.id = history.address_id
+                             INNER JOIN
+                               transactions AS output_transactions ON output_transactions.id = history.output_tx_id
+                             LEFT OUTER JOIN
+                               transactions AS input_transactions ON input_transactions.id = history.input_tx_id
                              WHERE
-                               address = ANY($1) AND
-                               (oheight > $2 OR
-                                iheight > $2 OR
-                                oheight IS NULL OR
-                                (iheight IS NULL AND itxid IS NOT NULL))`,
+                               addresses.address = ANY($1) AND
+                               (history.output_height > $2 OR
+                                history.input_height > $2 OR
+                                history.output_height IS NULL OR
+                                (history.input_height IS NULL AND history.input_tx_id IS NOT NULL))`,
       unspent: `SELECT
-                  otxid AS otxid,
-                  oindex AS oindex,
-                  ovalue AS ovalue,
-                  oscript AS oscript,
-                  oheight AS oheight
+                  output_transactions.txid AS otxid,
+                  history.output_index AS oindex,
+                  history.output_value AS ovalue,
+                  history.output_script AS oscript,
+                  history.output_height AS oheight
                 FROM
                   history
+                INNER JOIN
+                  addresses ON addresses.id = history.address_id
+                INNER JOIN
+                  transactions AS output_transactions ON output_transactions.id = history.output_tx_id
                 WHERE
-                  address = ANY($1) AND
-                  itxid IS NULL AND
-                  (((oheight > $2 OR iheight > $2) AND (oheight <= $3 OR iheight <= $3)) OR
-                   oheight IS NULL)`,
+                  addresses.address = ANY($1) AND
+                  history.input_tx_id IS NULL AND
+                  (history.output_height IS NULL OR
+                   (history.output_height > $2 AND history.output_height <= $3))`,
       unspentToLatest: `SELECT
-                          otxid AS otxid,
-                          oindex AS oindex,
-                          ovalue AS ovalue,
-                          oscript AS oscript,
-                          oheight AS oheight
+                          output_transactions.txid AS otxid,
+                          history.output_index AS oindex,
+                          history.output_value AS ovalue,
+                          history.output_script AS oscript,
+                          history.output_height AS oheight
                         FROM
                           history
+                        INNER JOIN
+                          addresses ON addresses.id = history.address_id
+                        INNER JOIN
+                          transactions AS output_transactions ON output_transactions.id = history.output_tx_id
                         WHERE
-                          address = ANY($1) AND
-                          itxid IS NULL AND
-                          (oheight > $2 OR iheight > $2 OR oheight IS NULL)`,
+                          addresses.address = ANY($1) AND
+                          history.input_tx_id IS NULL AND
+                          (history.output_height IS NULL OR history.output_height > $2)`,
       spent: `SELECT
-                itxid AS itxid,
-                iheight AS iheight
+                input_transactions.txid AS itxid,
+                history.input_height AS iheight
               FROM
                 history
+              LEFT OUTER JOIN
+                transactions AS input_transactions ON input_transactions.id = history.input_tx_id
+              INNER JOIN
+                transactions AS output_transactions ON output_transactions.id = history.output_tx_id
               WHERE
-                otxid = $1 AND
-                oindex = $2`
+                output_transactions.txid = $1 AND
+                history.output_index = $2`
     },
     newTxs: {
       all: `SELECT id FROM new_txs`
@@ -277,12 +402,14 @@ export default {
                   WHERE
                     height = $1
                   LIMIT 1`,
-      isTxScanned: `SELECT EXISTS (SELECT
-                                     true
-                                   FROM
-                                     cc_scanned_txids
-                                   WHERE
-                                     txid = $1)`,
+      isTxScanned: `SELECT EXISTS (
+                      SELECT
+                        true
+                      FROM
+                        cc_scanned_txids
+                      WHERE
+                        txid = $1
+                    )`,
       unconfirmed: `SELECT
                       txid AS txid
                     FROM
@@ -321,7 +448,7 @@ export default {
                       SET
                         height = $1
                       WHERE
-                        txid = $2`,
+                        id = ANY($2)`,
       makeUnconfirmed: `UPDATE
                           transactions
                         SET
@@ -331,68 +458,67 @@ export default {
                         RETURNING
                           txid`
     },
+    outputs: {
+      makeConfirmed: `UPDATE
+                        outputs
+                      SET
+                        height = $1
+                      WHERE
+                        outputs.tx_id = ANY($2)`,
+    },
+    inputs: {
+      makeConfirmed: `UPDATE
+                        inputs
+                      SET
+                        height = $1
+                      FROM
+                        outputs, transactions
+                      WHERE
+                        inputs.output_id = outputs.id AND
+                        outputs.tx_id = transactions.id AND
+                        transactions.txid = $2 AND
+                        outputs.index = $3`
+    },
     history: {
-      addConfirmedInput: `UPDATE
-                            history
-                          SET
-                            itxid = $1,
-                            iheight = $2
-                          WHERE
-                            otxid = $3 AND
-                            oindex = $4
-                          RETURNING
-                            address`,
       addUnconfirmedInput: `UPDATE
                               history
                             SET
-                              itxid = $1
+                              input_tx_id = $1
+                            FROM
+                              addresses, transactions
                             WHERE
-                              otxid = $2 AND
-                              oindex = $3
+                              history.address_id = addresses.id AND
+                              history.output_tx_id = transactions.id AND
+                              transactions.txid = $2 AND
+                              history.output_index = $3
                             RETURNING
-                              address`,
-      makeOutputConfirmed: `UPDATE
-                              history
-                            SET
-                              oheight = $1
-                            WHERE
-                              otxid = $2
-                            RETURNING
-                              address`,
+                              addresses.address AS address`,
       makeOutputsUnconfirmed: `UPDATE
                                  history
                                SET
-                                 oheight = NULL
+                                 output_height = NULL
+                               FROM
+                                 addresses, transactions
                                WHERE
-                                 oheight > $1
+                                 history.address_id = addresses.id AND
+                                 history.output_tx_id = transactions.id AND
+                                 history.output_height > $1
                                RETURNING
-                                 address AS address,
-                                 otxid AS txid`,
-      makeInputConfirmed: `UPDATE
-                             history
-                           SET
-                             iheight = $1
-                           WHERE
-                             otxid = $2 AND
-                             oindex = $3
-                           RETURNING
-                             address`,
+                                 addresses.address AS address,
+                                 transactions.txid AS txid`,
       makeInputsUnconfirmed: `UPDATE
                                 history
                               SET
-                                iheight = NULL
+                                input_height = NULL
+                              FROM
+                                addresses, transactions
                               WHERE
-                                iheight > $1
+                                history.address_id = addresses.id AND
+                                history.input_tx_id = transactions.id AND
+                                history.input_height > $1
                               RETURNING
-                                address AS address,
-                                itxid AS txid`,
-      deleteUnconfirmedInputsByTxIds: `UPDATE
-                                         history
-                                       SET
-                                         itxid = NULL
-                                       WHERE
-                                         iheight IS NULL AND
-                                         itxid = ANY($1)`
+                                addresses.address AS address,
+                                transactions.txid AS txid`
     },
     ccScannedTxIds: {
       makeUnconfirmed: `UPDATE
@@ -413,7 +539,12 @@ export default {
   },
   delete: {
     blocks: {
-      fromHeight: `DELETE FROM blocks WHERE height > $1 RETURNING hash`
+      fromHeight: `DELETE FROM
+                     blocks
+                   WHERE
+                     height > $1
+                   RETURNING
+                     hash AS hash`
     },
     transactions: {
       unconfirmedByTxIds: `DELETE FROM
@@ -422,22 +553,31 @@ export default {
                              height IS NULL AND
                              txid = ANY($1)
                            RETURNING
-                             txid`
+                             id AS id,
+                             txid AS txid`
     },
     history: {
       unconfirmedByTxIds: `DELETE FROM
                              history
                            WHERE
-                             oheight IS NULL AND
-                             otxid = ANY($1)
+                             history.output_tx_id = ANY($1) AND
+                             history.output_height IS NULL
                            RETURNING
-                             itxid AS itxid`
+                             history.input_tx_id AS itxid`
     },
     newTx: {
-      byId: `DELETE FROM new_txs WHERE id = $1 RETURNING tx`
+      byId: `DELETE FROM
+               new_txs
+             WHERE
+               id = $1
+             RETURNING
+               tx`
     },
     ccScannedTxIds: {
-      byTxId: `DELETE FROM cc_scanned_txids WHERE txid = $1`
+      byTxId: `DELETE FROM
+                 cc_scanned_txids
+               WHERE
+                 txid = $1`
     }
   }
 }

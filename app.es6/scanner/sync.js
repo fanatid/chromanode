@@ -72,8 +72,12 @@ export default class Sync extends EventEmitter {
    * @return {string[]}
    */
   _getAddresses (output) {
-    let result = script2addresses(output.script, this._bitcoinNetwork, false)
-    return result.addresses || []
+    if (output.script === null) {
+      return []
+    }
+
+    let result = script2addresses(output.script.toBuffer(), this._bitcoinNetwork, false)
+    return result.addresses
   }
 
   /**
@@ -84,17 +88,19 @@ export default class Sync extends EventEmitter {
   _getLatest (opts) {
     let execute = ::this._storage.executeTransaction
     if (_.has(opts, 'client')) {
-      execute = (fn) => fn(opts.client)
+      execute = fn => fn(opts.client)
     }
 
     return execute(async (client) => {
       let result = await client.queryAsync(SQL.select.blocks.latest)
-      if (result.rowCount === 0) {
+      if (result.rows.length === 0) {
         return {hash: ZERO_HASH, height: -1}
       }
 
-      let row = result.rows[0]
-      return {hash: row.hash.toString('hex'), height: row.height}
+      return {
+        hash: result.rows[0].hash.toString('hex'),
+        height: result.rows[0].height
+      }
     })
   }
 
@@ -130,7 +136,7 @@ export default class Sync extends EventEmitter {
   _importUnconfirmedTx (tx) {
     let txId = tx.id
     let prevTxIds = _.uniq(
-      tx.inputs.map((input) => input.prevTxId.toString('hex')))
+      tx.inputs.map(input => input.prevTxId.toString('hex')))
 
     return this._lock.withLock(prevTxIds.concat(txId), () => {
       let stopwatch = ElapsedTime.new().start()
@@ -144,9 +150,9 @@ export default class Sync extends EventEmitter {
 
         // all inputs exists?
         result = await client.queryAsync(
-          SQL.select.transactions.existsMany, [prevTxIds.map((i) => `\\x${i}`)])
+          SQL.select.transactions.existsMany, [prevTxIds.map(txId => `\\x${txId}`)])
         let deps = _.difference(
-          prevTxIds, result.rows.map((row) => row.txid.toString('hex')))
+          prevTxIds, result.rows.map(row => row.txid.toString('hex')))
 
         // some input not exists yet, mark as orphaned and delay
         if (deps.length > 0) {
@@ -159,15 +165,16 @@ export default class Sync extends EventEmitter {
         }
 
         // import transaction
-        let pImportTx = client.queryAsync(SQL.insert.transactions.unconfirmed, [
+        result = await client.queryAsync(SQL.insert.transactions.unconfirmed, [
           `\\x${txId}`,
           `\\x${tx.toString()}`
         ])
+        let txRowId = result.rows[0].id
 
         // import intputs
         let pImportInputs = tx.inputs.map(async (input, index) => {
           let {rows} = await client.queryAsync(SQL.update.history.addUnconfirmedInput, [
-            `\\x${txId}`,
+            txRowId,
             `\\x${input.prevTxId.toString('hex')}`,
             input.outputIndex
           ])
@@ -181,10 +188,13 @@ export default class Sync extends EventEmitter {
         // import outputs
         let pImportOutputs = tx.outputs.map((output, index) => {
           let addresses = this._getAddresses(output)
-          return addresses.map((address) => {
+          return addresses.map(async (address) => {
+            let {rows} = await client.queryAsync(SQL.select.addresses.id, [address])
+            let addressRowId = rows[0].id
+
             let pImport = client.queryAsync(SQL.insert.history.unconfirmedOutput, [
-              address,
-              `\\x${txId}`,
+              addressRowId,
+              txRowId,
               index,
               output.satoshis,
               `\\x${output.script.toHex()}`
@@ -197,7 +207,6 @@ export default class Sync extends EventEmitter {
 
         // wait all imports and broadcasts
         await* _.flattenDeep([
-          pImportTx,
           pImportInputs,
           pImportOutputs,
           this._service.broadcastTx(txId, null, null, {client: client}),
@@ -242,82 +251,83 @@ export default class Sync extends EventEmitter {
    */
   _importBlock (block, height, client) {
     let txIds = _.pluck(block.transactions, 'id')
-    let existingTx = {}
 
     let allTxIds = _.uniq(_.flatten(block.transactions.map((tx) => {
-      return tx.inputs.map((i) => i.prevTxId.toString('hex'))
+      return tx.inputs.map(input => input.prevTxId.toString('hex'))
     }).concat(txIds)))
 
     return this._lock.withLock(allTxIds, async () => {
       // import header
-      let pImportHeader = client.queryAsync(SQL.insert.blocks.row, [
+      await client.queryAsync(SQL.insert.blocks.row, [
         height,
         `\\x${block.hash}`,
         `\\x${block.header.toString()}`,
         `\\x${txIds.join('')}`
       ])
+      await this._service.broadcastBlock(block.hash, height, {client: client}),
+      await this._service.addBlock(block.hash, {client: client})
 
-      // import transactions & outputs
-      let pImportTxAndOutputs = await* block.transactions.map(async (tx, txIndex) => {
+      // extract ids for existing transactions
+      let result = await client.queryAsync(
+        SQL.select.transactions.existsMany, [txIds.map(txId => `\\x${txId}`)])
+      let txRowIds = _.zipObject(result.rows.map(row => [row.txid.toString('hex'), row.id]))
+      let existingTx = _.clone(txRowIds)
+
+      // update existed transactions
+      await client.queryAsync(
+        SQL.update.transactions.makeConfirmed, [height, _.values(txRowIds)])
+
+      // update existed outputs
+      await client.queryAsync(
+        SQL.update.outputs.makeConfirmed, [height, _.values(txRowIds)])
+      // select addresses and broadcast them
+      result = await client.queryAsync(
+        SQL.select.addresses.byOutputHeight, [height])
+      await* result.rows.map((row) => {
+        return this._service.broadcastAddress(
+          row.address.toString(), row.txid.toString('hex'), block.hash, height, {client: client})
+      })
+
+      // import transactions and outputs
+      await* block.transactions.map(async (tx, txIndex) => {
         let txId = txIds[txIndex]
-        let pImportTx
-        let pBroadcastAddreses
+        await this._service.broadcastTx(txId, block.hash, height, {client: client})
+        await this._service.addTx(txId, true, {client: client})
 
-        // tx already in storage ?
-        let result = await client.queryAsync(SQL.select.transactions.exists, [`\\x${txId}`])
-
-        // if already exist, mark output as confirmed and broadcast addresses
-        if (result.rows[0].exists === true) {
-          existingTx[txId] = true
-
-          pBroadcastAddreses = PUtils.try(async () => {
-            let [, {rows}] = await* [
-              client.queryAsync(SQL.update.transactions.makeConfirmed, [height, `\\x${txId}`]),
-              client.queryAsync(SQL.update.history.makeOutputConfirmed, [height, `\\x${txId}`])
-            ]
-
-            return rows.map((row) => {
-              let address = row.address.toString()
-              return this._service.broadcastAddress(address, txId, block.hash, height, {client: client})
-            })
-          })
-        } else {
-          // import transaction
-          pImportTx = client.queryAsync(SQL.insert.transactions.confirmed, [
-            `\\x${txId}`,
-            height,
-            `\\x${tx.toString()}`
-          ])
-
-          // import outputs only if transaction not imported yet
-          pBroadcastAddreses = await* tx.outputs.map((output, index) => {
-            let addresses = this._getAddresses(output)
-            return Promise.all(addresses.map(async (address) => {
-              // wait output import, it's important!
-              await client.queryAsync(SQL.insert.history.confirmedOutput, [
-                address,
-                `\\x${txId}`,
-                index,
-                output.satoshis,
-                `\\x${output.script.toHex()}`,
-                height
-              ])
-
-              return this._service.broadcastAddress(address, txId, block.hash, height, {client: client})
-            }))
-          })
+        if (existingTx[txId]) {
+          return
         }
 
-        return [
-          pImportTx,
-          this._service.broadcastTx(txId, block.hash, height, {client: client}),
-          this._service.addTx(txId, true, {client: client}),
-          pBroadcastAddreses
-        ]
+        // import transaction
+        let {rows} = await client.queryAsync(SQL.insert.transactions.confirmed, [
+          `\\x${txId}`,
+          height,
+          `\\x${tx.toString()}`
+        ])
+        txRowIds[txId] = rows[0].id
+
+        // import outputs
+        await* tx.outputs.map(async (output, index) => {
+          let {rows} = await client.queryAsync(SQL.insert.outputs.confirmed, [
+            txRowIds[txId],
+            index,
+            output.satoshis,
+            `\\x${output._scriptBuffer.toString('hex')}`,
+            height
+          ])
+          let outputRowId = rows[0].id
+
+          await* this._getAddresses(output).map(async (address) => {
+            await* [
+              client.queryAsync(SQL.insert.outputs_addresses.row, [outputRowId, address]),
+              this._service.broadcastAddress(address, txId, block.hash, height, {client: client})
+            ]
+          })
+        })
       })
 
       // import inputs
-      let pImportInputs = block.transactions.map((tx, txIndex) => {
+      await* block.transactions.map((tx, txIndex) => {
         let txId = txIds[txIndex]
         return tx.inputs.map(async (input, index) => {
           // skip coinbase
@@ -328,36 +338,31 @@ export default class Sync extends EventEmitter {
             return
           }
 
-          let result
           if (existingTx[txId] === true) {
-            result = await client.queryAsync(SQL.update.history.makeInputConfirmed, [
+            await client.queryAsync(SQL.update.inputs.makeConfirmed, [
               height,
               `\\x${prevTxId}`,
               input.outputIndex
             ])
           } else {
-            result = await client.queryAsync(SQL.update.history.addConfirmedInput, [
-              `\\x${txId}`,
-              height,
+            await client.queryAsync(SQL.insert.inputs.confirmed, [
               `\\x${prevTxId}`,
-              input.outputIndex
+              input.outputIndex,
+              txRowIds[txId],
+              index,
+              height,
             ])
           }
-
-          await* result.rows.map((row) => {
-            let address = row.address.toString()
-            return this._service.broadcastAddress(address, txId, block.hash, height, {client: client})
-          })
         })
       })
 
-      await* _.flattenDeep([
-        pImportHeader,
-        pImportTxAndOutputs,
-        pImportInputs,
-        this._service.broadcastBlock(block.hash, height, {client: client}),
-        this._service.addBlock(block.hash, {client: client})
-      ])
+      // broadcast about inputs addresses
+      result = await client.queryAsync(
+        SQL.select.addresses.byInputHeight, [height])
+      await* result.rows.map((row) => {
+        return this._service.broadcastAddress(
+          row.address.toString(), row.txid.toString('hex'), block.hash, height, {client: client})
+      })
     })
   }
 
@@ -406,6 +411,9 @@ export default class Sync extends EventEmitter {
 
           // was reorg found?
           if (latest.hash !== this._latest.hash) {
+            // stub
+            console.log('REORG FOUND!')
+            process.exit(1)
             await this._lock.exclusiveLock(async () => {
               stopwatch.reset().start()
               this._latest = await this._storage.executeTransaction(async (client) => {
@@ -469,7 +477,7 @@ export default class Sync extends EventEmitter {
       }
     }
 
-    await this._runMempoolUpdateWithoutLock(updateBitcoindMempool)
+    // await this._runMempoolUpdateWithoutLock(updateBitcoindMempool)
   }
 
   /**
@@ -490,16 +498,16 @@ export default class Sync extends EventEmitter {
           this._storage.executeQuery(SQL.select.transactions.unconfirmed)
         ]
 
-        sTxIds = sTxIds.rows.map((row) => row.txid.toString('hex'))
+        sTxIds = sTxIds.rows.map(row => row.txid.toString('hex'))
 
         let rTxIds = _.difference(sTxIds, nTxIds)
         if (rTxIds.length > 0 && updateBitcoindMempool) {
           let {rows} = await this._storage.executeQuery(
-            SQL.select.transactions.byTxIds, [rTxIds.map((txId) => `\\x${txId}`)])
+            SQL.select.transactions.byTxIds, [rTxIds.map(txId => `\\x${txId}`)])
 
           rTxIds = []
 
-          let txs = util.toposort(rows.map((row) => bitcore.Transaction(row.tx)))
+          let txs = util.toposort(rows.map(row => bitcore.Transaction(row.tx)))
           while (txs.length > 0) {
             let tx = txs.pop()
             try {
@@ -517,20 +525,20 @@ export default class Sync extends EventEmitter {
               let txIds = rTxIds.slice(start, start + 250)
               await this._storage.executeTransaction(async (client) => {
                 while (txIds.length > 0) {
-                  let result = await client.queryAsync(
+                  let {rows} = await client.queryAsync(
                     SQL.delete.transactions.unconfirmedByTxIds, [txIds.map((txId) => `\\x${txId}`)])
-                  if (result.rows.length === 0) {
+                  if (rows.length === 0) {
                     return
                   }
 
-                  let removedTxIds = result.rows.map((row) => row.txid.toString('hex'))
-                  let params = [removedTxIds.map((txId) => `\\x${txId}`)]
+                  let result = await client.queryAsync(
+                    SQL.delete.history.unconfirmedByTxIds, [_.pluck(rows, 'id')])
+                  txIds = _.filter(result.rows, 'itxid').map((row) => row.itxid.toString('hex'))
 
-                  result = await client.queryAsync(SQL.delete.history.unconfirmedByTxIds, params)
-                  txIds = _.filter(result.rows, 'txid').map((row) => row.txid.toString('hex'))
-
-                  await client.queryAsync(SQL.update.history.deleteUnconfirmedInputsByTxIds, params)
-                  await* removedTxIds.map((txId) => this._service.removeTx(txId, false, {client: client}))
+                  await* rows.map((row) => {
+                    let txId = row.txid.toString('hex')
+                    return this._service.removeTx(txId, false, {client: client})
+                  })
                 }
               })
             }
@@ -566,8 +574,8 @@ export default class Sync extends EventEmitter {
     await this._runBlockImport(true)
 
     // set handlers
-    this._network.on('connect', () => this._runMempoolUpdate(true))
-    this._network.on('tx', ::this._runTxImport)
+    // this._network.on('connect', () => this._runMempoolUpdate(true))
+    // this._network.on('tx', ::this._runTxImport)
     this._network.on('block', ::this._runBlockImport)
 
     // and run sync again
