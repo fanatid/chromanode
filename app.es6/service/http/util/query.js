@@ -126,7 +126,7 @@ async function getHeightForPoint (client, point) {
                : [SQL.select.blocks.heightByHash, [`\\x${point}`]]
 
   let result = await client.queryAsync(...args)
-  if (result.rowCount === 0) {
+  if (result.rows.length === 0) {
     return null
   }
 

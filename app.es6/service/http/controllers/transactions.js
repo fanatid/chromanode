@@ -26,7 +26,7 @@ v1.merkle = v2.merkle = function (req, res) {
     let result = await req.storage.executeQuery(
       SQL.select.blocks.txIdsByTxId, [`\\x${txId}`])
 
-    if (result.rowCount === 0) {
+    if (result.rows.length === 0) {
       throw new errors.Service.TxNotFound(txId)
     }
 
@@ -84,7 +84,7 @@ v2.spent = function (req, res) {
     let result = await req.storage.executeQuery(
       SQL.select.history.spent, [`\\x${oTxId}`, oindex])
 
-    if (result.rowCount === 0) {
+    if (result.rows.length === 0) {
       throw new errors.Service.TxNotFound(oTxId)
     }
 
