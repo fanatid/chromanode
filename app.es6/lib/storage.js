@@ -14,7 +14,7 @@ let pg = PUtils.promisifyAll(require('pg').native)
  */
 @mixin(ReadyMixin)
 export default class Storage {
-  _version = '4'
+  _version = '5'
 
   /**
    * @constructor
@@ -40,7 +40,9 @@ export default class Storage {
         'info',
         'blocks',
         'transactions',
-        'history',
+        'addresses',
+        'utxo',
+        'spent',
         'new_txs',
         'cc_scanned_txids'
       ]])
@@ -49,8 +51,8 @@ export default class Storage {
 
       if (count === 0) {
         await this._createEnv(client)
-      } else if (count !== 6) {
-        throw new errors.Storage.InconsistentTables(count, 6)
+      } else if (count !== 8) {
+        throw new errors.Storage.InconsistentTables(count, 8)
       }
 
       let [version, network] = await* [
@@ -59,14 +61,14 @@ export default class Storage {
       ]
 
       // check version
-      if (version.rowCount !== 1 ||
+      if (version.rows.length !== 1 ||
           version.rows[0].value !== this._version) {
         throw new errors.Storage.InvalidVersion(
           version.rows[0].value, this._version)
       }
 
       // check network
-      if (network.rowCount !== 1 ||
+      if (network.rows.length !== 1 ||
           network.rows[0].value !== config.get('chromanode.network')) {
         throw new errors.Storage.InvalidNetwork(
           network.rows[0].value, config.get('chromanode.network'))
